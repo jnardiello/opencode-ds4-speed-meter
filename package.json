@@ -1,0 +1,42 @@
+{
+  "name": "opencode-ds4-speed-meter",
+  "version": "0.2.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    "./server": {
+      "import": "./server.ts",
+      "config": {
+        "providerID": "ds4",
+        "timeoutMs": 2000
+      }
+    },
+    "./tui": {
+      "import": "./tui.tsx",
+      "config": {
+        "providerID": "ds4",
+        "intervalMs": 2000,
+        "requestTimeoutMs": 1500
+      }
+    }
+  },
+  "engines": {
+    "opencode": ">=1.18.15"
+  },
+  "peerDependencies": {
+    "@opencode-ai/plugin": ">=1.18.15",
+    "@opentui/solid": ">=0.4.5",
+    "solid-js": ">=1.9.0"
+  },
+  "peerDependenciesMeta": {
+    "@opentui/solid": {
+      "optional": true
+    },
+    "solid-js": {
+      "optional": true
+    }
+  },
+  "scripts": {
+    "test": "node --test ds4-speed-meter-core.test.mjs"
+  }
+}
