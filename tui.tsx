@@ -2,7 +2,7 @@
 
 import type { TuiPlugin, TuiPluginApi } from "@opencode-ai/plugin/tui"
 import { createSignal, type Accessor } from "solid-js"
-import { createStatsPoller, statsTarget, tuiOptions } from "./ds4-speed-meter-core.mjs"
+import { createStatsPoller, statsTargets, tuiOptions } from "./ds4-speed-meter-core.mjs"
 
 type Metric =
   | { status: "loading" }
@@ -22,7 +22,7 @@ function provider(api: TuiPluginApi, providerID: string) {
   }
 }
 
-function View(props: { api: TuiPluginApi; metric: Accessor<Metric> }) {
+function View(props: { api: TuiPluginApi; label: string; metric: Accessor<Metric> }) {
   const theme = () => props.api.theme.current
   const value = () => {
     const metric = props.metric()
@@ -35,7 +35,7 @@ function View(props: { api: TuiPluginApi; metric: Accessor<Metric> }) {
   return (
     <box flexDirection="row" gap={2}>
       <text fg={theme().text}>
-        <b>DS4</b>
+        <b>{props.label}</b>
       </text>
       <text fg={props.metric().status === "offline" ? theme().warning : theme().textMuted}>{value()}</text>
     </box>
@@ -49,11 +49,11 @@ const tui: TuiPlugin = async (api, rawOptions) => {
     intervalMs: options.intervalMs,
     requestTimeoutMs: options.requestTimeoutMs,
     fetchImpl: globalThis.fetch,
-    getTarget() {
+    getTargets() {
       const value = provider(api, options.providerID)
       if (!value) return
       try {
-        return statsTarget(value)
+        return statsTargets(value, options)
       } catch {
         return
       }
@@ -67,7 +67,7 @@ const tui: TuiPlugin = async (api, rawOptions) => {
     order: 50,
     slots: {
       sidebar_content() {
-        return <View api={api} metric={metric} />
+        return <View api={api} label={options.label} metric={metric} />
       },
     },
   })

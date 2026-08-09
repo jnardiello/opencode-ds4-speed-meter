@@ -1,6 +1,6 @@
 {
   "name": "opencode-ds4-speed-meter",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "private": true,
   "type": "module",
   "exports": {
@@ -15,6 +15,11 @@
       "import": "./tui.tsx",
       "config": {
         "providerID": "ds4",
+        "label": "DS4",
+        "statsPaths": [
+          "stats",
+          "../metrics"
+        ],
         "intervalMs": 2000,
         "requestTimeoutMs": 1500
       }
