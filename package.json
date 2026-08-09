@@ -1,6 +1,6 @@
 {
   "name": "opencode-ds4-speed-meter",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "private": true,
   "type": "module",
   "exports": {
@@ -21,7 +21,8 @@
           "../metrics"
         ],
         "intervalMs": 2000,
-        "requestTimeoutMs": 1500
+        "requestTimeoutMs": 1500,
+        "windowMs": 6000
       }
     }
   },

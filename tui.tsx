@@ -2,12 +2,21 @@
 
 import type { TuiPlugin, TuiPluginApi } from "@opencode-ai/plugin/tui"
 import { createSignal, type Accessor } from "solid-js"
-import { createStatsPoller, statsTargets, tuiOptions } from "./ds4-speed-meter-core.mjs"
+import { createStatsPoller, formatMeter, statsTargets, tuiOptions } from "./ds4-speed-meter-core.mjs"
 
 type Metric =
   | { status: "loading" }
   | { status: "offline" }
-  | { status: "online"; rate: number; requestsInflight: number }
+  | {
+      status: "online"
+      rate: number
+      requestsInflight: number
+      requestsRunning?: number
+      requestsWaiting?: number
+      prefillTokens?: number
+      kvCacheUsage?: number
+      draftAcceptance?: number
+    }
 
 function provider(api: TuiPluginApi, providerID: string) {
   const configured = api.state.config.provider?.[providerID]
@@ -24,20 +33,21 @@ function provider(api: TuiPluginApi, providerID: string) {
 
 function View(props: { api: TuiPluginApi; label: string; metric: Accessor<Metric> }) {
   const theme = () => props.api.theme.current
-  const value = () => {
-    const metric = props.metric()
-    if (metric.status === "loading") return "— tok/s"
-    if (metric.status === "offline") return "— tok/s · offline"
-    if (metric.requestsInflight === 0 && metric.rate === 0) return "0.0 tok/s · idle"
-    return `${metric.rate.toFixed(1)} tok/s`
-  }
+  const formatted = () => formatMeter(props.metric())
+  const metricColor = () => (props.metric().status === "offline" ? theme().warning : theme().textMuted)
 
   return (
-    <box flexDirection="row" gap={2}>
-      <text fg={theme().text}>
-        <b>{props.label}</b>
-      </text>
-      <text fg={props.metric().status === "offline" ? theme().warning : theme().textMuted}>{value()}</text>
+    <box flexDirection="column">
+      <box flexDirection="row" gap={2}>
+        <text fg={theme().text}>
+          <b>{props.label}</b>
+        </text>
+        <text fg={metricColor()}>{formatted().primary}</text>
+      </box>
+      <box flexDirection="row" gap={2}>
+        <text fg={theme().text}>{" ".repeat(props.label.length)}</text>
+        <text fg={metricColor()}>{formatted().secondary}</text>
+      </box>
     </box>
   )
 }
@@ -48,6 +58,7 @@ const tui: TuiPlugin = async (api, rawOptions) => {
   const poller = createStatsPoller({
     intervalMs: options.intervalMs,
     requestTimeoutMs: options.requestTimeoutMs,
+    windowMs: options.windowMs,
     fetchImpl: globalThis.fetch,
     getTargets() {
       const value = provider(api, options.providerID)

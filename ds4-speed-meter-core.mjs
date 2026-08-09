@@ -2,6 +2,7 @@ const DEFAULT_PROVIDER_ID = "ds4"
 const DEFAULT_MODELS_TIMEOUT_MS = 2_000
 const DEFAULT_STATS_INTERVAL_MS = 2_000
 const DEFAULT_STATS_TIMEOUT_MS = 1_500
+const DEFAULT_WINDOW_MS = 6_000
 const DEFAULT_STATS_PATHS = Object.freeze(["stats", "../metrics"])
 const DEFAULT_LABEL = "DS4"
 
@@ -107,6 +108,7 @@ export function tuiOptions(options = {}) {
     statsURL,
     intervalMs: optionPositiveInteger(options, "intervalMs", DEFAULT_STATS_INTERVAL_MS),
     requestTimeoutMs: optionPositiveInteger(options, "requestTimeoutMs", DEFAULT_STATS_TIMEOUT_MS),
+    windowMs: optionPositiveInteger(options, "windowMs", DEFAULT_WINDOW_MS),
   }
 }
 
@@ -258,6 +260,10 @@ const PROMETHEUS_TOKEN_METRICS = new Set([
   "vllm:generation_tokens_total",
   "vllm_generation_tokens_total",
 ])
+const PROMETHEUS_PROMPT_METRICS = new Set([
+  "vllm:prompt_tokens_by_source_total",
+  "vllm_prompt_tokens_by_source_total",
+])
 const PROMETHEUS_RUNNING_METRICS = new Set([
   "vllm:num_requests_running",
   "vllm_num_requests_running",
@@ -266,13 +272,85 @@ const PROMETHEUS_WAITING_METRICS = new Set([
   "vllm:num_requests_waiting",
   "vllm_num_requests_waiting",
 ])
+const PROMETHEUS_KV_CACHE_METRICS = new Set([
+  "vllm:kv_cache_usage_perc",
+  "vllm_kv_cache_usage_perc",
+])
+const PROMETHEUS_DRAFT_TOKEN_METRICS = new Set([
+  "vllm:spec_decode_num_draft_tokens_total",
+  "vllm_spec_decode_num_draft_tokens_total",
+])
+const PROMETHEUS_ACCEPTED_TOKEN_METRICS = new Set([
+  "vllm:spec_decode_num_accepted_tokens_total",
+  "vllm_spec_decode_num_accepted_tokens_total",
+])
+const prometheusCounterSeries = new WeakMap()
+
+function addPrometheusCounterSeries(series, field, labels, value) {
+  const key = JSON.stringify(Object.entries(labels).sort(([left], [right]) => left.localeCompare(right)))
+  const values = series[field]
+  values.set(key, (values.get(key) ?? 0) + value)
+}
+
+function prometheusLabels(source) {
+  const labels = {}
+  let index = 0
+
+  function skipWhitespace() {
+    while (/\s/.test(source[index] ?? "")) index += 1
+  }
+
+  skipWhitespace()
+  while (index < source.length) {
+    const name = source.slice(index).match(/^([a-zA-Z_][a-zA-Z0-9_]*)/)?.[1]
+    if (name === undefined) return
+    index += name.length
+    skipWhitespace()
+    if (source[index] !== "=") return
+    index += 1
+    skipWhitespace()
+    if (source[index] !== '"') return
+    index += 1
+
+    let labelValue = ""
+    let closed = false
+    while (index < source.length) {
+      const character = source[index]
+      index += 1
+      if (character === '"') {
+        closed = true
+        break
+      }
+      if (character !== "\\") {
+        labelValue += character
+        continue
+      }
+      if (index >= source.length) return
+      const escaped = source[index]
+      index += 1
+      labelValue += escaped === "n" ? "\n" : escaped
+    }
+    if (!closed) return
+    labels[name] = labelValue
+
+    skipWhitespace()
+    if (index >= source.length) break
+    if (source[index] !== ",") return
+    index += 1
+    skipWhitespace()
+  }
+
+  return labels
+}
 
 function prometheusSample(line) {
   const nameMatch = line.match(/^([a-zA-Z_:][a-zA-Z0-9_:]*)/)
   if (!nameMatch) return
 
   let index = nameMatch[0].length
+  let labels = {}
   if (line[index] === "{") {
+    const labelsStart = index + 1
     let quoted = false
     let escaped = false
     let closed = false
@@ -285,6 +363,8 @@ function prometheusSample(line) {
       } else if (character === '"') {
         quoted = !quoted
       } else if (!quoted && character === "}") {
+        labels = prometheusLabels(line.slice(labelsStart, index))
+        if (labels === undefined) return
         index += 1
         closed = true
         break
@@ -297,15 +377,30 @@ function prometheusSample(line) {
   while (/\s/.test(line[index] ?? "")) index += 1
   const rawValue = line.slice(index).match(/^[^\s#]+/)?.[0]
   if (rawValue === undefined) return
-  return { name: nameMatch[1], value: Number(rawValue) }
+  return { labels, name: nameMatch[1], value: Number(rawValue) }
 }
 
 function parsePrometheusStats(text) {
   let tokensDecoded = 0
+  let promptTokens = 0
   let requestsRunning = 0
   let requestsWaiting = 0
+  let kvCacheUsage = 0
+  let draftTokens = 0
+  let acceptedTokens = 0
   let tokenSamples = 0
-  let requestSamples = 0
+  let promptSamples = 0
+  let runningSamples = 0
+  let waitingSamples = 0
+  let kvCacheSamples = 0
+  let draftSamples = 0
+  let acceptedSamples = 0
+  const counterSeries = {
+    tokensDecoded: new Map(),
+    promptTokens: new Map(),
+    draftTokens: new Map(),
+    acceptedTokens: new Map(),
+  }
 
   for (const line of text.split(/\r?\n/)) {
     const value = line.trim()
@@ -313,31 +408,59 @@ function parsePrometheusStats(text) {
 
     const parsed = prometheusSample(value)
     if (!parsed) continue
-    const { name, value: sample } = parsed
+    const { labels, name, value: sample } = parsed
     if (nonnegativeNumber(sample) === undefined) continue
 
     if (PROMETHEUS_TOKEN_METRICS.has(name)) {
       tokensDecoded += sample
       tokenSamples += 1
+      addPrometheusCounterSeries(counterSeries, "tokensDecoded", labels, sample)
+    } else if (PROMETHEUS_PROMPT_METRICS.has(name) && labels.source === "local_compute") {
+      promptTokens += sample
+      promptSamples += 1
+      addPrometheusCounterSeries(counterSeries, "promptTokens", labels, sample)
     } else if (PROMETHEUS_RUNNING_METRICS.has(name)) {
       requestsRunning += sample
-      requestSamples += 1
+      runningSamples += 1
     } else if (PROMETHEUS_WAITING_METRICS.has(name)) {
       requestsWaiting += sample
-      requestSamples += 1
+      waitingSamples += 1
+    } else if (PROMETHEUS_KV_CACHE_METRICS.has(name)) {
+      kvCacheUsage = Math.max(kvCacheUsage, sample)
+      kvCacheSamples += 1
+    } else if (PROMETHEUS_DRAFT_TOKEN_METRICS.has(name)) {
+      draftTokens += sample
+      draftSamples += 1
+      addPrometheusCounterSeries(counterSeries, "draftTokens", labels, sample)
+    } else if (PROMETHEUS_ACCEPTED_TOKEN_METRICS.has(name)) {
+      acceptedTokens += sample
+      acceptedSamples += 1
+      addPrometheusCounterSeries(counterSeries, "acceptedTokens", labels, sample)
     }
   }
 
   const requestsInflight = requestsRunning + requestsWaiting
   if (
     tokenSamples === 0 ||
-    requestSamples === 0 ||
+    runningSamples + waitingSamples === 0 ||
     nonnegativeNumber(tokensDecoded) === undefined ||
     nonnegativeInteger(requestsInflight) === undefined
   ) {
     throw new Error("stats endpoint returned an invalid Prometheus payload")
   }
-  return { tokensDecoded, requestsInflight }
+
+  const result = {
+    tokensDecoded,
+    requestsInflight,
+    requestsRunning,
+    requestsWaiting,
+  }
+  if (promptSamples > 0) result.promptTokens = promptTokens
+  if (kvCacheSamples > 0) result.kvCacheUsage = kvCacheUsage
+  if (draftSamples > 0) result.draftTokens = draftTokens
+  if (acceptedSamples > 0) result.acceptedTokens = acceptedTokens
+  prometheusCounterSeries.set(result, counterSeries)
+  return result
 }
 
 export function parseStatsPayload(payload) {
@@ -378,6 +501,170 @@ export function calculateDecodeRate(previous, current) {
   return decoded / elapsedSeconds
 }
 
+const TELEMETRY_COUNTER_FIELDS = Object.freeze([
+  "tokensDecoded",
+  "promptTokens",
+  "draftTokens",
+  "acceptedTokens",
+])
+
+function telemetryCountersReset(previous, current) {
+  if (previous === undefined) return false
+  if (TELEMETRY_COUNTER_FIELDS.some(
+    (field) =>
+      nonnegativeNumber(previous[field]) !== undefined &&
+      nonnegativeNumber(current[field]) !== undefined &&
+      current[field] < previous[field],
+  )) {
+    return true
+  }
+
+  const previousSeries = prometheusCounterSeries.get(previous)
+  const currentSeries = prometheusCounterSeries.get(current)
+  if (previousSeries === undefined || currentSeries === undefined) return false
+  return TELEMETRY_COUNTER_FIELDS.some((field) => {
+    for (const [key, currentValue] of currentSeries[field]) {
+      const previousValue = previousSeries[field].get(key)
+      if (previousValue !== undefined && currentValue < previousValue) return true
+    }
+    return false
+  })
+}
+
+export function calculateWindowTelemetry(samples, windowMs = DEFAULT_WINDOW_MS) {
+  if (!Array.isArray(samples) || samples.length === 0) return { rate: 0 }
+  const durationMs = positiveInteger(windowMs) ?? DEFAULT_WINDOW_MS
+  const current = samples.at(-1)
+  if (!isRecord(current) || nonnegativeNumber(current.tokensDecoded) === undefined) return { rate: 0 }
+
+  let resetIndex = 0
+  for (let index = 1; index < samples.length; index += 1) {
+    if (telemetryCountersReset(samples[index - 1], samples[index])) resetIndex = index
+  }
+
+  const cutoff = current.sampledAt - durationMs
+  const candidates = samples.slice(resetIndex).filter((sample) => Number.isFinite(sample.sampledAt))
+  const firstInside = candidates.findIndex((sample) => sample.sampledAt >= cutoff)
+  const start =
+    firstInside <= 0 || candidates[firstInside].sampledAt === cutoff
+      ? Math.max(0, firstInside)
+      : firstInside - 1
+  const recent = candidates.slice(start)
+  if (recent.length === 0 || recent.at(-1) !== current) recent.push(current)
+
+  function counterDelta(field) {
+    if (nonnegativeNumber(current[field]) === undefined) return
+    const baseline = recent.find((sample) => nonnegativeNumber(sample[field]) !== undefined)
+    if (baseline === undefined) return
+    const delta = current[field] - baseline[field]
+    return Number.isFinite(delta) && delta >= 0 ? delta : 0
+  }
+
+  const decodeBaseline = recent.find((sample) => nonnegativeNumber(sample.tokensDecoded) !== undefined)
+  const rate = calculateDecodeRate(decodeBaseline, current)
+  const result = { rate }
+
+  const prefillTokens = counterDelta("promptTokens")
+  if (prefillTokens !== undefined) result.prefillTokens = prefillTokens
+
+  if (
+    nonnegativeNumber(current.draftTokens) !== undefined &&
+    nonnegativeNumber(current.acceptedTokens) !== undefined
+  ) {
+    const draftBaseline = recent.find(
+      (sample) =>
+        nonnegativeNumber(sample.draftTokens) !== undefined &&
+        nonnegativeNumber(sample.acceptedTokens) !== undefined,
+    )
+    if (draftBaseline !== undefined) {
+      const draftTokens = current.draftTokens - draftBaseline.draftTokens
+      const acceptedTokens = current.acceptedTokens - draftBaseline.acceptedTokens
+      if (draftTokens > 0 && acceptedTokens >= 0) {
+        result.draftAcceptance = Math.min(1, acceptedTokens / draftTokens)
+      }
+    }
+  }
+  return result
+}
+
+export function formatCompactSI(value) {
+  if (nonnegativeNumber(value) === undefined) return "—"
+  const suffixes = ["", "k", "M", "G"]
+  let unit = 0
+  let scaled = value
+  while (scaled >= 1_000 && unit < suffixes.length - 1) {
+    scaled /= 1_000
+    unit += 1
+  }
+  if (unit === 0) return String(Math.round(scaled))
+
+  let rounded = scaled < 100 ? Number(scaled.toFixed(1)) : Math.round(scaled)
+  if (rounded >= 1_000 && unit < suffixes.length - 1) {
+    rounded /= 1_000
+    unit += 1
+  }
+  return `${rounded < 100 ? rounded.toFixed(1) : Math.round(rounded)}${suffixes[unit]}`
+}
+
+function formatRate(rate) {
+  if (nonnegativeNumber(rate) === undefined) return "—"
+  return rate < 1_000 ? rate.toFixed(1) : formatCompactSI(rate)
+}
+
+function formatPercent(ratio) {
+  if (nonnegativeNumber(ratio) === undefined) return "—"
+  return `${Math.round(Math.min(1, ratio) * 100)}%`
+}
+
+function onlineTelemetryState(metric) {
+  const hasRequestBreakdown =
+    nonnegativeInteger(metric.requestsRunning) !== undefined &&
+    nonnegativeInteger(metric.requestsWaiting) !== undefined
+  const running = hasRequestBreakdown ? metric.requestsRunning : metric.requestsInflight
+  const waiting = hasRequestBreakdown ? metric.requestsWaiting : 0
+
+  if (running === 0 && waiting === 0) return "IDLE"
+  if (running === 0 && waiting > 0) return "QUEUE"
+
+  const prefillActive = nonnegativeNumber(metric.prefillTokens) !== undefined && metric.prefillTokens > 0
+  const decodeActive = nonnegativeNumber(metric.rate) !== undefined && metric.rate > 0
+  if (prefillActive && decodeActive) return "MIXED"
+  if (prefillActive) return "PREFILL"
+  if (decodeActive) return "DECODE"
+  return "WORK"
+}
+
+export function formatMeter(metric) {
+  const status = metric?.status
+  if (status === "loading" || status === "offline") {
+    const state = status === "loading" ? "LOADING" : "OFFLINE"
+    return {
+      state,
+      primary: `${state} · P — · D — tok/s`,
+      secondary: "Req — · KV — · DS —",
+    }
+  }
+
+  if (status !== "online") {
+    return {
+      state: "OFFLINE",
+      primary: "OFFLINE · P — · D — tok/s",
+      secondary: "Req — · KV — · DS —",
+    }
+  }
+
+  const state = onlineTelemetryState(metric)
+  const prefill = nonnegativeNumber(metric.prefillTokens) === undefined ? "—" : formatCompactSI(metric.prefillTokens)
+  const primary = `${state} · P ${prefill} · D ${formatRate(metric.rate)} tok/s`
+  const requestBreakdown =
+    nonnegativeInteger(metric.requestsRunning) !== undefined &&
+    nonnegativeInteger(metric.requestsWaiting) !== undefined
+      ? `R${metric.requestsRunning} Q${metric.requestsWaiting}`
+      : `Req ${nonnegativeInteger(metric.requestsInflight) ?? "—"}`
+  const secondary = `${requestBreakdown} · KV ${formatPercent(metric.kvCacheUsage)} · DS ${formatPercent(metric.draftAcceptance)}`
+  return { state, primary, secondary }
+}
+
 function defaultTimers() {
   return {
     setInterval: globalThis.setInterval.bind(globalThis),
@@ -396,12 +683,13 @@ export function createStatsPoller(options) {
 
   const intervalMs = positiveInteger(options.intervalMs) ?? DEFAULT_STATS_INTERVAL_MS
   const requestTimeoutMs = positiveInteger(options.requestTimeoutMs) ?? DEFAULT_STATS_TIMEOUT_MS
+  const windowMs = positiveInteger(options.windowMs) ?? DEFAULT_WINDOW_MS
   const now = typeof options.now === "function" ? options.now : Date.now
   const timers = options.timers ?? defaultTimers()
   let interval
   let requestTimer
   let requestController
-  let previous
+  let history = []
   let targetURL
   let preferredTargetURL
   let active = false
@@ -465,7 +753,7 @@ export function createStatsPoller(options) {
     try {
       const targets = currentTargets()
       if (targets.length === 0) {
-        previous = undefined
+        history = []
         targetURL = undefined
         emit({ status: "offline" })
         return false
@@ -482,23 +770,58 @@ export function createStatsPoller(options) {
         if (stopped) return false
 
         if (targetURL !== target.url) {
-          previous = undefined
+          history = []
           targetURL = target.url
         }
         preferredTargetURL = target.url
 
         const sample = { ...fields, sampledAt: now() }
-        const rate = calculateDecodeRate(previous, sample)
-        previous = sample
-        emit({ status: "online", rate, requestsInflight: sample.requestsInflight })
+        const series = prometheusCounterSeries.get(fields)
+        if (series !== undefined) prometheusCounterSeries.set(sample, series)
+        const previous = history.at(-1)
+        if (telemetryCountersReset(previous, sample)) history = []
+
+        let telemetry
+        if (sample.requestsInflight === 0) {
+          history = [sample]
+          telemetry = { rate: 0 }
+          if (nonnegativeNumber(sample.promptTokens) !== undefined) telemetry.prefillTokens = 0
+        } else {
+          history.push(sample)
+          const cutoff = sample.sampledAt - windowMs
+          while (history.length > 2 && history[1].sampledAt <= cutoff) history.shift()
+          telemetry = calculateWindowTelemetry(history, windowMs)
+        }
+
+        const update = {
+          status: "online",
+          rate: telemetry.rate,
+          requestsInflight: sample.requestsInflight,
+        }
+        if (nonnegativeInteger(sample.requestsRunning) !== undefined) {
+          update.requestsRunning = sample.requestsRunning
+        }
+        if (nonnegativeInteger(sample.requestsWaiting) !== undefined) {
+          update.requestsWaiting = sample.requestsWaiting
+        }
+        if (nonnegativeNumber(telemetry.prefillTokens) !== undefined) {
+          update.prefillTokens = telemetry.prefillTokens
+        }
+        if (nonnegativeNumber(sample.kvCacheUsage) !== undefined) {
+          update.kvCacheUsage = sample.kvCacheUsage
+        }
+        if (nonnegativeNumber(telemetry.draftAcceptance) !== undefined) {
+          update.draftAcceptance = telemetry.draftAcceptance
+        }
+        emit(update)
         return true
       }
 
-      previous = undefined
+      history = []
       if (!stopped) emit({ status: "offline" })
       return false
     } catch {
-      previous = undefined
+      history = []
       if (!stopped) emit({ status: "offline" })
       return false
     } finally {
@@ -523,7 +846,7 @@ export function createStatsPoller(options) {
     interval = undefined
     requestTimer = undefined
     requestController = undefined
-    previous = undefined
+    history = []
   }
 
   return {
