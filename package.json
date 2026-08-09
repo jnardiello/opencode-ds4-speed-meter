@@ -1,9 +1,20 @@
 {
   "name": "opencode-ds4-speed-meter",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "private": true,
   "type": "module",
+  "keywords": [
+    "pi-package",
+    "vllm",
+    "telemetry"
+  ],
   "exports": {
+    "./core": {
+      "import": "./ds4-speed-meter-core.mjs"
+    },
+    "./pi": {
+      "import": "./pi.ts"
+    },
     "./server": {
       "import": "./server.ts",
       "config": {
@@ -26,15 +37,28 @@
       }
     }
   },
+  "pi": {
+    "extensions": [
+      "./pi.ts"
+    ]
+  },
   "engines": {
-    "opencode": ">=1.18.15"
+    "opencode": ">=1.18.15",
+    "pi": ">=0.83.0"
   },
   "peerDependencies": {
+    "@earendil-works/pi-coding-agent": ">=0.83.0",
     "@opencode-ai/plugin": ">=1.18.15",
     "@opentui/solid": ">=0.4.5",
     "solid-js": ">=1.9.0"
   },
   "peerDependenciesMeta": {
+    "@earendil-works/pi-coding-agent": {
+      "optional": true
+    },
+    "@opencode-ai/plugin": {
+      "optional": true
+    },
     "@opentui/solid": {
       "optional": true
     },
@@ -43,6 +67,8 @@
     }
   },
   "scripts": {
-    "test": "node --test ds4-speed-meter-core.test.mjs"
+    "test": "node --test",
+    "test:hermes": "python3 -m unittest discover -s tests -p 'test_*.py'",
+    "check": "npm test && npm run test:hermes && node --check ds4-speed-meter-core.mjs && node --check pi-beast-telemetry.mjs && node --check hermes/widget-core.mjs && node --check hermes/beast-meter.mjs"
   }
 }

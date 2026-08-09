@@ -8,6 +8,7 @@ import {
   createStatsPoller,
   formatCompactSI,
   formatMeter,
+  formatMeterLines,
   parseStatsPayload,
   refreshDS4Limits,
   statsTarget,
@@ -450,6 +451,26 @@ test("formats legacy JSON and Entrpi metrics without inventing enriched fields",
   })
   assert.equal(formatMeter({ status: "online", rate: 12.34, requestsInflight: 1 }).state, "DECODE")
   assert.equal(formatMeter({ status: "online", rate: 0, requestsInflight: 0 }).state, "IDLE")
+})
+
+test("formats aligned host-neutral meter lines", () => {
+  assert.deepEqual(
+    formatMeterLines(" Beast ", {
+      status: "online",
+      rate: 39.2,
+      requestsInflight: 1,
+      requestsRunning: 1,
+      requestsWaiting: 0,
+      prefillTokens: 12_400,
+      kvCacheUsage: 0.38,
+      draftAcceptance: 0.68,
+    }),
+    ["Beast  MIXED · P 12.4k · D 39.2 tok/s", "       R1 Q0 · KV 38% · DS 68%"],
+  )
+  assert.deepEqual(formatMeterLines("", { status: "loading" }), [
+    "DS4  LOADING · P — · D — tok/s",
+    "     Req — · KV — · DS —",
+  ])
 })
 
 test("normalizes TUI defaults and explicit polling options", () => {

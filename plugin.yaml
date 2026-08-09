@@ -1,0 +1,10 @@
+name: beast-telemetry
+version: 0.5.0
+manifest_version: 1
+description: Expose the active Hermes inference endpoint to the Beast telemetry widget.
+kind: standalone
+provides_hooks:
+  - on_session_start
+  - pre_api_request
+  - on_session_finalize
+  - on_session_reset

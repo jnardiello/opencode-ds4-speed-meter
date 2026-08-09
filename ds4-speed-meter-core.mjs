@@ -665,6 +665,16 @@ export function formatMeter(metric) {
   return { state, primary, secondary }
 }
 
+export function formatMeterLines(label, metric) {
+  const normalizedLabel =
+    typeof label === "string" && label.trim() ? label.trim() : DEFAULT_LABEL
+  const formatted = formatMeter(metric)
+  return [
+    `${normalizedLabel}  ${formatted.primary}`,
+    `${" ".repeat(normalizedLabel.length)}  ${formatted.secondary}`,
+  ]
+}
+
 function defaultTimers() {
   return {
     setInterval: globalThis.setInterval.bind(globalThis),
