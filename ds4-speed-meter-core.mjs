@@ -1,10 +1,9 @@
-const DEFAULT_PROVIDER_ID = "ds4"
 const DEFAULT_MODELS_TIMEOUT_MS = 2_000
 const DEFAULT_STATS_INTERVAL_MS = 2_000
 const DEFAULT_STATS_TIMEOUT_MS = 1_500
 const DEFAULT_WINDOW_MS = 6_000
 const DEFAULT_STATS_PATHS = Object.freeze(["stats", "../metrics"])
-const DEFAULT_LABEL = "DS4"
+const DEFAULT_LABEL = "METER"
 
 function isRecord(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value)
@@ -88,7 +87,7 @@ function optionPositiveInteger(options, key, fallback) {
 
 export function serverOptions(options = {}) {
   return {
-    providerID: optionString(options, "providerID", DEFAULT_PROVIDER_ID),
+    providerID: optionOptionalString(options, "providerID"),
     timeoutMs: optionPositiveInteger(options, "timeoutMs", DEFAULT_MODELS_TIMEOUT_MS),
   }
 }
@@ -100,9 +99,10 @@ export function tuiOptions(options = {}) {
     statsURL === undefined && statsPath === undefined
       ? (optionOptionalStringArray(options, "statsPaths") ?? [...DEFAULT_STATS_PATHS])
       : undefined
+  const providerID = optionOptionalString(options, "providerID")
   return {
-    providerID: optionString(options, "providerID", DEFAULT_PROVIDER_ID),
-    label: optionString(options, "label", DEFAULT_LABEL),
+    providerID,
+    label: optionString(options, "label", providerID ? providerID.toUpperCase() : DEFAULT_LABEL),
     statsPath,
     statsPaths,
     statsURL,
@@ -188,8 +188,8 @@ export function statsTarget(provider, options = {}) {
   return statsTargets(provider, options)[0]
 }
 
-export async function refreshDS4Limits(provider, fetchImpl, timeoutMs = DEFAULT_MODELS_TIMEOUT_MS) {
-  if (!isRecord(provider)) throw new Error("provider ds4 is not configured")
+export async function refreshProviderLimits(provider, fetchImpl, timeoutMs = DEFAULT_MODELS_TIMEOUT_MS) {
+  if (!isRecord(provider)) throw new Error("provider is not configured")
   if (typeof fetchImpl !== "function") throw new Error("fetch is unavailable")
 
   const timeout = withTimeout(timeoutMs)
@@ -234,7 +234,7 @@ export async function refreshDS4Limits(provider, fetchImpl, timeoutMs = DEFAULT_
     applied.push({ modelID, context, output })
   }
 
-  if (applied.length === 0) throw new Error("/models did not contain a configured ds4 model with valid limits")
+  if (applied.length === 0) throw new Error("/models did not contain a configured model with valid limits")
   return applied
 }
 
@@ -259,30 +259,42 @@ function parseTextStats(text) {
 const PROMETHEUS_TOKEN_METRICS = new Set([
   "vllm:generation_tokens_total",
   "vllm_generation_tokens_total",
+  "tensorfold:generation_tokens_total",
 ])
-const PROMETHEUS_PROMPT_METRICS = new Set([
+const PROMETHEUS_PROMPT_BY_SOURCE_METRICS = new Set([
   "vllm:prompt_tokens_by_source_total",
   "vllm_prompt_tokens_by_source_total",
+])
+// Engines that expose one aggregate prompt counter without a source label.
+const PROMETHEUS_PROMPT_TOTAL_METRICS = new Set([
+  "vllm:prompt_tokens_total",
+  "vllm_prompt_tokens_total",
+  "tensorfold:prompt_tokens_total",
 ])
 const PROMETHEUS_RUNNING_METRICS = new Set([
   "vllm:num_requests_running",
   "vllm_num_requests_running",
+  "tensorfold:requests_running",
 ])
 const PROMETHEUS_WAITING_METRICS = new Set([
   "vllm:num_requests_waiting",
   "vllm_num_requests_waiting",
+  "tensorfold:requests_waiting",
 ])
 const PROMETHEUS_KV_CACHE_METRICS = new Set([
   "vllm:kv_cache_usage_perc",
   "vllm_kv_cache_usage_perc",
+  "tensorfold:kv_cache_usage_ratio",
 ])
 const PROMETHEUS_DRAFT_TOKEN_METRICS = new Set([
   "vllm:spec_decode_num_draft_tokens_total",
   "vllm_spec_decode_num_draft_tokens_total",
+  "tensorfold:mtp_drafted_total",
 ])
 const PROMETHEUS_ACCEPTED_TOKEN_METRICS = new Set([
   "vllm:spec_decode_num_accepted_tokens_total",
   "vllm_spec_decode_num_accepted_tokens_total",
+  "tensorfold:mtp_accepted_total",
 ])
 const prometheusCounterSeries = new WeakMap()
 
@@ -415,7 +427,12 @@ function parsePrometheusStats(text) {
       tokensDecoded += sample
       tokenSamples += 1
       addPrometheusCounterSeries(counterSeries, "tokensDecoded", labels, sample)
-    } else if (PROMETHEUS_PROMPT_METRICS.has(name) && labels.source === "local_compute") {
+    } else if (PROMETHEUS_PROMPT_BY_SOURCE_METRICS.has(name)) {
+      if (labels.source !== "local_compute") continue
+      promptTokens += sample
+      promptSamples += 1
+      addPrometheusCounterSeries(counterSeries, "promptTokens", labels, sample)
+    } else if (PROMETHEUS_PROMPT_TOTAL_METRICS.has(name)) {
       promptTokens += sample
       promptSamples += 1
       addPrometheusCounterSeries(counterSeries, "promptTokens", labels, sample)
@@ -501,6 +518,36 @@ export function calculateDecodeRate(previous, current) {
   return decoded / elapsedSeconds
 }
 
+// An interval counts as engine-active when either endpoint saw requests in
+// flight; samples without an inflight value count as active.
+function intervalCountsAsActive(previous, current) {
+  const previousInflight = nonnegativeInteger(previous.requestsInflight)
+  const currentInflight = nonnegativeInteger(current.requestsInflight)
+  if (previousInflight === undefined || currentInflight === undefined) return true
+  return previousInflight > 0 || currentInflight > 0
+}
+
+function activeWindowSeconds(samples) {
+  let total = 0
+  for (let index = 1; index < samples.length; index += 1) {
+    const elapsed = (samples[index].sampledAt - samples[index - 1].sampledAt) / 1_000
+    if (!Number.isFinite(elapsed) || elapsed <= 0) continue
+    if (!intervalCountsAsActive(samples[index - 1], samples[index])) continue
+    total += elapsed
+  }
+  return total
+}
+
+// Counter deltas measured against engine-active time only: idle intervals
+// between the baseline and the current sample must not dilute the tok/s, so a
+// short burst measures against the last pre-burst counter value.
+function tokensOverActiveSeconds(baseline, current, activeSeconds) {
+  if (baseline === undefined || baseline === current) return 0
+  const tokens = current.tokensDecoded - baseline.tokensDecoded
+  if (!Number.isFinite(tokens) || tokens < 0 || activeSeconds <= 0) return 0
+  return tokens / activeSeconds
+}
+
 const TELEMETRY_COUNTER_FIELDS = Object.freeze([
   "tokensDecoded",
   "promptTokens",
@@ -560,12 +607,13 @@ export function calculateWindowTelemetry(samples, windowMs = DEFAULT_WINDOW_MS) 
     return Number.isFinite(delta) && delta >= 0 ? delta : 0
   }
 
-  const decodeBaseline = recent.find((sample) => nonnegativeNumber(sample.tokensDecoded) !== undefined)
-  const rate = calculateDecodeRate(decodeBaseline, current)
-  const result = { rate }
+  const activeSeconds = activeWindowSeconds(recent)
 
-  const prefillTokens = counterDelta("promptTokens")
-  if (prefillTokens !== undefined) result.prefillTokens = prefillTokens
+  const decodeBaseline = recent.find((sample) => nonnegativeNumber(sample.tokensDecoded) !== undefined)
+  const result = { rate: tokensOverActiveSeconds(decodeBaseline, current, activeSeconds) }
+
+  const promptTokens = counterDelta("promptTokens")
+  if (promptTokens !== undefined) result.prefillRate = activeSeconds > 0 ? promptTokens / activeSeconds : 0
 
   if (
     nonnegativeNumber(current.draftTokens) !== undefined &&
@@ -626,7 +674,7 @@ function onlineTelemetryState(metric) {
   if (running === 0 && waiting === 0) return "IDLE"
   if (running === 0 && waiting > 0) return "QUEUE"
 
-  const prefillActive = nonnegativeNumber(metric.prefillTokens) !== undefined && metric.prefillTokens > 0
+  const prefillActive = nonnegativeNumber(metric.prefillRate) !== undefined && metric.prefillRate > 0
   const decodeActive = nonnegativeNumber(metric.rate) !== undefined && metric.rate > 0
   if (prefillActive && decodeActive) return "MIXED"
   if (prefillActive) return "PREFILL"
@@ -640,7 +688,7 @@ export function formatMeter(metric) {
     const state = status === "loading" ? "LOADING" : "OFFLINE"
     return {
       state,
-      primary: `${state} · P — · D — tok/s`,
+      primary: `${state} · P — tok/s · D — tok/s`,
       secondary: "Req — · KV — · DS —",
     }
   }
@@ -648,14 +696,14 @@ export function formatMeter(metric) {
   if (status !== "online") {
     return {
       state: "OFFLINE",
-      primary: "OFFLINE · P — · D — tok/s",
+      primary: "OFFLINE · P — tok/s · D — tok/s",
       secondary: "Req — · KV — · DS —",
     }
   }
 
   const state = onlineTelemetryState(metric)
-  const prefill = nonnegativeNumber(metric.prefillTokens) === undefined ? "—" : formatCompactSI(metric.prefillTokens)
-  const primary = `${state} · P ${prefill} · D ${formatRate(metric.rate)} tok/s`
+  const prefill = nonnegativeNumber(metric.prefillRate) === undefined ? "—" : formatRate(metric.prefillRate)
+  const primary = `${state} · P ${prefill} tok/s · D ${formatRate(metric.rate)} tok/s`
   const requestBreakdown =
     nonnegativeInteger(metric.requestsRunning) !== undefined &&
     nonnegativeInteger(metric.requestsWaiting) !== undefined
@@ -791,17 +839,13 @@ export function createStatsPoller(options) {
         const previous = history.at(-1)
         if (telemetryCountersReset(previous, sample)) history = []
 
-        let telemetry
-        if (sample.requestsInflight === 0) {
-          history = [sample]
-          telemetry = { rate: 0 }
-          if (nonnegativeNumber(sample.promptTokens) !== undefined) telemetry.prefillTokens = 0
-        } else {
-          history.push(sample)
-          const cutoff = sample.sampledAt - windowMs
-          while (history.length > 2 && history[1].sampledAt <= cutoff) history.shift()
-          telemetry = calculateWindowTelemetry(history, windowMs)
-        }
+        // Idle samples stay in the history: the next burst is then measured
+        // against the last pre-burst counter value instead of being clipped
+        // to zero by a baseline that resets on every idle poll.
+        history.push(sample)
+        const cutoff = sample.sampledAt - windowMs
+        while (history.length > 2 && history[1].sampledAt <= cutoff) history.shift()
+        const telemetry = calculateWindowTelemetry(history, windowMs)
 
         const update = {
           status: "online",
@@ -814,8 +858,8 @@ export function createStatsPoller(options) {
         if (nonnegativeInteger(sample.requestsWaiting) !== undefined) {
           update.requestsWaiting = sample.requestsWaiting
         }
-        if (nonnegativeNumber(telemetry.prefillTokens) !== undefined) {
-          update.prefillTokens = telemetry.prefillTokens
+        if (nonnegativeNumber(telemetry.prefillRate) !== undefined) {
+          update.prefillRate = telemetry.prefillRate
         }
         if (nonnegativeNumber(sample.kvCacheUsage) !== undefined) {
           update.kvCacheUsage = sample.kvCacheUsage
@@ -866,39 +910,5 @@ export function createStatsPoller(options) {
     get active() {
       return active
     },
-  }
-}
-
-export function createDS4SpeedMeterServerPlugin(rawOptions = {}) {
-  const options = serverOptions(rawOptions)
-  const logger = rawOptions.logger ?? console
-
-  return async () => {
-    let warned = false
-
-    function warnOnce(message) {
-      if (warned) return
-      warned = true
-      logger.warn?.(`[opencode-ds4-speed-meter] ${message}`)
-    }
-
-    return {
-      async config(config) {
-        const provider = config.provider?.[options.providerID]
-        if (!isRecord(provider)) {
-          warnOnce(`provider ${options.providerID} is not configured; plugin disabled`)
-          return
-        }
-
-        if (!isRecord(provider.options)) provider.options = {}
-        const fetchImpl = typeof provider.options.fetch === "function" ? provider.options.fetch : globalThis.fetch
-        try {
-          await refreshDS4Limits(provider, fetchImpl, options.timeoutMs)
-        } catch (error) {
-          const message = error instanceof Error ? error.message : String(error)
-          warnOnce(`dynamic limits unavailable (${message}); keeping configured fallback`)
-        }
-      },
-    }
   }
 }

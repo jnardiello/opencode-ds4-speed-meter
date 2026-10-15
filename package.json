@@ -9,6 +9,9 @@
     "telemetry"
   ],
   "exports": {
+    ".": {
+      "import": "./index.ts"
+    },
     "./core": {
       "import": "./ds4-speed-meter-core.mjs"
     },
@@ -16,25 +19,10 @@
       "import": "./pi.ts"
     },
     "./server": {
-      "import": "./server.ts",
-      "config": {
-        "providerID": "ds4",
-        "timeoutMs": 2000
-      }
+      "import": "./server.ts"
     },
     "./tui": {
-      "import": "./tui.tsx",
-      "config": {
-        "providerID": "ds4",
-        "label": "DS4",
-        "statsPaths": [
-          "stats",
-          "../metrics"
-        ],
-        "intervalMs": 2000,
-        "requestTimeoutMs": 1500,
-        "windowMs": 6000
-      }
+      "import": "./tui.tsx"
     }
   },
   "pi": {
@@ -43,12 +31,12 @@
     ]
   },
   "engines": {
-    "opencode": ">=1.18.15",
+    "opencode": ">=2.0.0",
     "pi": ">=0.83.0"
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": ">=0.83.0",
-    "@opencode-ai/plugin": ">=1.18.15",
+    "@opencode/plugin": ">=2.0.0",
     "@opentui/solid": ">=0.4.5",
     "solid-js": ">=1.9.0"
   },
@@ -56,7 +44,7 @@
     "@earendil-works/pi-coding-agent": {
       "optional": true
     },
-    "@opencode-ai/plugin": {
+    "@opencode/plugin": {
       "optional": true
     },
     "@opentui/solid": {

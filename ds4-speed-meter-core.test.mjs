@@ -4,13 +4,12 @@ import test from "node:test"
 import {
   calculateDecodeRate,
   calculateWindowTelemetry,
-  createDS4SpeedMeterServerPlugin,
   createStatsPoller,
   formatCompactSI,
   formatMeter,
   formatMeterLines,
   parseStatsPayload,
-  refreshDS4Limits,
+  refreshProviderLimits,
   statsTarget,
   statsTargets,
   tuiOptions,
@@ -51,11 +50,9 @@ function config(fetchImpl, context = 100_000) {
   }
 }
 
-const quiet = { info() {}, warn() {} }
-
-test("updates configured limits from the DS4 model endpoint", async () => {
+test("updates configured limits from the model endpoint", async () => {
   const cfg = config(async () => modelResponse(300_000, 280_000))
-  const applied = await refreshDS4Limits(cfg.provider.ds4, cfg.provider.ds4.options.fetch)
+  const applied = await refreshProviderLimits(cfg.provider.ds4, cfg.provider.ds4.options.fetch)
 
   assert.deepEqual(applied, [{ modelID: "deepseek-v4-flash", context: 300_000, output: 280_000 }])
   assert.deepEqual(cfg.provider.ds4.models["deepseek-v4-flash"].limit, {
@@ -65,17 +62,12 @@ test("updates configured limits from the DS4 model endpoint", async () => {
 })
 
 test("keeps configured limits when discovery fails", async () => {
-  const warnings = []
   const cfg = config(async () => {
     throw new Error("offline")
   })
-  const plugin = createDS4SpeedMeterServerPlugin({ logger: { ...quiet, warn: (value) => warnings.push(value) } })
-  const hooks = await plugin({})
 
-  await hooks.config(cfg)
-
+  await assert.rejects(() => refreshProviderLimits(cfg.provider.ds4, cfg.provider.ds4.options.fetch))
   assert.equal(cfg.provider.ds4.models["deepseek-v4-flash"].limit.context, 100_000)
-  assert.equal(warnings.length, 1)
 })
 
 test("builds the stats target from the configured provider", () => {
@@ -204,6 +196,24 @@ vllm_num_requests_running 0
   assert.throws(() => parseStatsPayload("vllm:generation_tokens_total 42"), /invalid Prometheus payload/)
 })
 
+test("parses aggregate prompt token totals without a source label", () => {
+  assert.deepEqual(
+    parseStatsPayload(`# HELP tensorfold:prompt_tokens_total Prefill tokens.
+# TYPE tensorfold:prompt_tokens_total counter
+tensorfold:prompt_tokens_total 12000
+tensorfold:generation_tokens_total 300
+tensorfold:requests_running 2
+`),
+    {
+      tokensDecoded: 300,
+      requestsInflight: 2,
+      requestsRunning: 2,
+      requestsWaiting: 0,
+      promptTokens: 12_000,
+    },
+  )
+})
+
 test("parses labels and aggregates enriched vLLM and DSpark telemetry", () => {
   assert.deepEqual(
     parseStatsPayload(`# HELP vllm:prompt_tokens_by_source_total Number of prompt tokens by source.
@@ -249,6 +259,40 @@ vllm:num_requests_running 1
   )
 })
 
+test("parses and aggregates TensorFold Prometheus metrics", () => {
+  assert.deepEqual(
+    parseStatsPayload(`# HELP tensorfold:requests_running Requests in prefill or decode.
+# TYPE tensorfold:requests_running gauge
+tensorfold:requests_running 2
+# TYPE tensorfold:requests_waiting gauge
+tensorfold:requests_waiting 3
+# TYPE tensorfold:prompt_tokens_total counter
+tensorfold:prompt_tokens_total 1232466
+# TYPE tensorfold:generation_tokens_total counter
+tensorfold:generation_tokens_total 24782
+# TYPE tensorfold:kv_cache_usage_ratio gauge
+tensorfold:kv_cache_usage_ratio{pool="0"} 0.42
+# TYPE tensorfold:mtp_drafted_total counter
+tensorfold:mtp_drafted_total 24476
+# TYPE tensorfold:mtp_accepted_total counter
+tensorfold:mtp_accepted_total 15354
+# TYPE tensorfold:request_latency_seconds histogram
+tensorfold:request_latency_seconds_bucket{le="0.5"} 5
+tensorfold:request_latency_seconds_count 50
+`),
+    {
+      tokensDecoded: 24_782,
+      requestsInflight: 5,
+      requestsRunning: 2,
+      requestsWaiting: 3,
+      promptTokens: 1_232_466,
+      kvCacheUsage: 0.42,
+      draftTokens: 24_476,
+      acceptedTokens: 15_354,
+    },
+  )
+})
+
 test("calculates an interval decode rate through completion and handles idle or reset samples", () => {
   const previous = { tokensDecoded: 100, requestsInflight: 1, sampledAt: 1_000 }
   assert.equal(
@@ -281,7 +325,7 @@ test("calculates prefill, decode, and DSpark acceptance over an irregular six-se
     6_000,
   )
 
-  assert.equal(telemetry.prefillTokens, 6_000)
+  assert.equal(telemetry.prefillRate, 6_000 / 6.3)
   assert.ok(Math.abs(telemetry.rate - 216 / 6.3) < 1e-12)
   assert.ok(Math.abs(telemetry.draftAcceptance - 76 / 110) < 1e-12)
 })
@@ -291,11 +335,25 @@ test("uses the actual elapsed interval when a delayed poll crosses the full wind
     calculateWindowTelemetry(
       [
         { sampledAt: 0, tokensDecoded: 100, promptTokens: 1_000 },
-        { sampledAt: 7_000, tokensDecoded: 170, promptTokens: 1_600 },
+        { sampledAt: 7_000, tokensDecoded: 170, promptTokens: 8_000 },
       ],
       6_000,
     ),
-    { rate: 10, prefillTokens: 600 },
+    { rate: 10, prefillRate: 1_000 },
+  )
+})
+
+test("measures a burst against the last idle sample instead of clipping it to zero", () => {
+  assert.equal(
+    calculateWindowTelemetry(
+      [
+        { sampledAt: 0, tokensDecoded: 1_000, requestsInflight: 0 },
+        { sampledAt: 2_000, tokensDecoded: 1_000, requestsInflight: 0 },
+        { sampledAt: 3_000, tokensDecoded: 1_050, requestsInflight: 1 },
+      ],
+      6_000,
+    ).rate,
+    50,
   )
 })
 
@@ -317,7 +375,7 @@ test("resets every rolling delta when any engine counter decreases", () => {
       { sampledAt: 2_000, tokensDecoded: 140, promptTokens: 1_400, draftTokens: 140, acceptedTokens: 80 },
       { sampledAt: 4_000, tokensDecoded: 5, promptTokens: 20, draftTokens: 4, acceptedTokens: 2 },
     ]),
-    { rate: 0, prefillTokens: 0 },
+    { rate: 0, prefillRate: 0 },
   )
 })
 
@@ -332,7 +390,7 @@ test("formats compact SI values and every TUI engine state", () => {
       { status: "loading" },
       {
         state: "LOADING",
-        primary: "LOADING · P — · D — tok/s",
+        primary: "LOADING · P — tok/s · D — tok/s",
         secondary: "Req — · KV — · DS —",
       },
     ],
@@ -340,7 +398,7 @@ test("formats compact SI values and every TUI engine state", () => {
       { status: "offline" },
       {
         state: "OFFLINE",
-        primary: "OFFLINE · P — · D — tok/s",
+        primary: "OFFLINE · P — tok/s · D — tok/s",
         secondary: "Req — · KV — · DS —",
       },
     ],
@@ -351,12 +409,12 @@ test("formats compact SI values and every TUI engine state", () => {
         requestsInflight: 0,
         requestsRunning: 0,
         requestsWaiting: 0,
-        prefillTokens: 0,
+        prefillRate: 0,
         kvCacheUsage: 0,
       },
       {
         state: "IDLE",
-        primary: "IDLE · P 0 · D 0.0 tok/s",
+        primary: "IDLE · P 0.0 tok/s · D 0.0 tok/s",
         secondary: "R0 Q0 · KV 0% · DS —",
       },
     ],
@@ -367,12 +425,12 @@ test("formats compact SI values and every TUI engine state", () => {
         requestsInflight: 2,
         requestsRunning: 0,
         requestsWaiting: 2,
-        prefillTokens: 0,
+        prefillRate: 0,
         kvCacheUsage: 0.12,
       },
       {
         state: "QUEUE",
-        primary: "QUEUE · P 0 · D 0.0 tok/s",
+        primary: "QUEUE · P 0.0 tok/s · D 0.0 tok/s",
         secondary: "R0 Q2 · KV 12% · DS —",
       },
     ],
@@ -383,11 +441,11 @@ test("formats compact SI values and every TUI engine state", () => {
         requestsInflight: 1,
         requestsRunning: 1,
         requestsWaiting: 0,
-        prefillTokens: 0,
+        prefillRate: 0,
       },
       {
         state: "WORK",
-        primary: "WORK · P 0 · D 0.0 tok/s",
+        primary: "WORK · P 0.0 tok/s · D 0.0 tok/s",
         secondary: "R1 Q0 · KV — · DS —",
       },
     ],
@@ -398,11 +456,11 @@ test("formats compact SI values and every TUI engine state", () => {
         requestsInflight: 1,
         requestsRunning: 1,
         requestsWaiting: 0,
-        prefillTokens: 12_400,
+        prefillRate: 12_400,
       },
       {
         state: "PREFILL",
-        primary: "PREFILL · P 12.4k · D 0.0 tok/s",
+        primary: "PREFILL · P 12.4k tok/s · D 0.0 tok/s",
         secondary: "R1 Q0 · KV — · DS —",
       },
     ],
@@ -413,11 +471,11 @@ test("formats compact SI values and every TUI engine state", () => {
         requestsInflight: 1,
         requestsRunning: 1,
         requestsWaiting: 0,
-        prefillTokens: 0,
+        prefillRate: 0,
       },
       {
         state: "DECODE",
-        primary: "DECODE · P 0 · D 39.2 tok/s",
+        primary: "DECODE · P 0.0 tok/s · D 39.2 tok/s",
         secondary: "R1 Q0 · KV — · DS —",
       },
     ],
@@ -428,13 +486,13 @@ test("formats compact SI values and every TUI engine state", () => {
         requestsInflight: 1,
         requestsRunning: 1,
         requestsWaiting: 0,
-        prefillTokens: 12_400,
+        prefillRate: 12_400,
         kvCacheUsage: 0.375,
         draftAcceptance: 0.675,
       },
       {
         state: "MIXED",
-        primary: "MIXED · P 12.4k · D 39.2 tok/s",
+        primary: "MIXED · P 12.4k tok/s · D 39.2 tok/s",
         secondary: "R1 Q0 · KV 38% · DS 68%",
       },
     ],
@@ -446,7 +504,7 @@ test("formats compact SI values and every TUI engine state", () => {
 test("formats legacy JSON and Entrpi metrics without inventing enriched fields", () => {
   assert.deepEqual(formatMeter({ status: "online", rate: 0, requestsInflight: 1 }), {
     state: "WORK",
-    primary: "WORK · P — · D 0.0 tok/s",
+    primary: "WORK · P — tok/s · D 0.0 tok/s",
     secondary: "Req 1 · KV — · DS —",
   })
   assert.equal(formatMeter({ status: "online", rate: 12.34, requestsInflight: 1 }).state, "DECODE")
@@ -461,22 +519,22 @@ test("formats aligned host-neutral meter lines", () => {
       requestsInflight: 1,
       requestsRunning: 1,
       requestsWaiting: 0,
-      prefillTokens: 12_400,
+      prefillRate: 12_400,
       kvCacheUsage: 0.38,
       draftAcceptance: 0.68,
     }),
-    ["Beast  MIXED · P 12.4k · D 39.2 tok/s", "       R1 Q0 · KV 38% · DS 68%"],
+    ["Beast  MIXED · P 12.4k tok/s · D 39.2 tok/s", "       R1 Q0 · KV 38% · DS 68%"],
   )
   assert.deepEqual(formatMeterLines("", { status: "loading" }), [
-    "DS4  LOADING · P — · D — tok/s",
-    "     Req — · KV — · DS —",
+    "METER  LOADING · P — tok/s · D — tok/s",
+    "       Req — · KV — · DS —",
   ])
 })
 
 test("normalizes TUI defaults and explicit polling options", () => {
   assert.deepEqual(tuiOptions(), {
-    providerID: "ds4",
-    label: "DS4",
+    providerID: undefined,
+    label: "METER",
     statsPath: undefined,
     statsPaths: ["stats", "../metrics"],
     statsURL: undefined,
@@ -507,8 +565,8 @@ test("normalizes TUI defaults and explicit polling options", () => {
     },
   )
   assert.deepEqual(tuiOptions({ statsPath: "../metrics", statsPaths: ["ignored"] }), {
-    providerID: "ds4",
-    label: "DS4",
+    providerID: undefined,
+    label: "METER",
     statsPath: "../metrics",
     statsPaths: undefined,
     statsURL: undefined,
@@ -699,14 +757,14 @@ test("poller changes preference after failure and can switch back", async () => 
   poller.stop()
 })
 
-test("poller emits rolling engine telemetry and enters idle immediately", async () => {
+test("poller keeps the rolling window across idle samples so bursts measure against pre-burst counters", async () => {
   const updates = []
   const times = [0, 2_000, 4_000, 6_000]
   const payloads = [
     engineMetrics({ decoded: 100, prefill: 1_000, draft: 100, accepted: 50, kv: 0.1 }),
     engineMetrics({ decoded: 120, prefill: 1_300, draft: 120, accepted: 62, kv: 0.38, running: 1 }),
     engineMetrics({ decoded: 140, prefill: 1_500, draft: 150, accepted: 80, kv: 0.2 }),
-    engineMetrics({ decoded: 140, prefill: 1_500, draft: 150, accepted: 80, kv: 0.2, running: 1 }),
+    engineMetrics({ decoded: 160, prefill: 1_600, draft: 160, accepted: 80, kv: 0.2, running: 1 }),
   ]
   const poller = createStatsPoller({
     windowMs: 6_000,
@@ -724,7 +782,7 @@ test("poller emits rolling engine telemetry and enters idle immediately", async 
     requestsInflight: 0,
     requestsRunning: 0,
     requestsWaiting: 0,
-    prefillTokens: 0,
+    prefillRate: 0,
     kvCacheUsage: 0.1,
   })
   assert.deepEqual(updates[1], {
@@ -733,31 +791,35 @@ test("poller emits rolling engine telemetry and enters idle immediately", async 
     requestsInflight: 1,
     requestsRunning: 1,
     requestsWaiting: 0,
-    prefillTokens: 300,
+    prefillRate: 150,
     kvCacheUsage: 0.38,
     draftAcceptance: 0.6,
   })
   assert.equal(formatMeter(updates[1]).state, "MIXED")
+  // The idle sample stays in the window: the rate decays over active time
+  // instead of resetting, so the next burst is not clipped to zero.
   assert.deepEqual(updates[2], {
     status: "online",
-    rate: 0,
+    rate: 10,
     requestsInflight: 0,
     requestsRunning: 0,
     requestsWaiting: 0,
-    prefillTokens: 0,
+    prefillRate: 125,
     kvCacheUsage: 0.2,
+    draftAcceptance: 0.6,
   })
   assert.equal(formatMeter(updates[2]).state, "IDLE")
   assert.deepEqual(updates[3], {
     status: "online",
-    rate: 0,
+    rate: 10,
     requestsInflight: 1,
     requestsRunning: 1,
     requestsWaiting: 0,
-    prefillTokens: 0,
+    prefillRate: 100,
     kvCacheUsage: 0.2,
+    draftAcceptance: 0.5,
   })
-  assert.equal(formatMeter(updates[3]).state, "WORK")
+  assert.equal(formatMeter(updates[3]).state, "MIXED")
   poller.stop()
 })
 
@@ -785,16 +847,16 @@ test("poller clears the complete window on counter reset and offline recovery", 
   assert.equal(await poller.poll(), true)
   assert.equal(await poller.poll(), true)
   assert.equal(updates[1].rate, 20)
-  assert.equal(updates[1].prefillTokens, 400)
+  assert.equal(updates[1].prefillRate, 200)
   assert.equal(await poller.poll(), true)
   assert.equal(updates[2].rate, 0)
-  assert.equal(updates[2].prefillTokens, 0)
+  assert.equal(updates[2].prefillRate, 0)
   assert.equal(updates[2].draftAcceptance, undefined)
   assert.equal(await poller.poll(), false)
   assert.deepEqual(updates[3], { status: "offline" })
   assert.equal(await poller.poll(), true)
   assert.equal(updates[4].rate, 0)
-  assert.equal(updates[4].prefillTokens, 0)
+  assert.equal(updates[4].prefillRate, 0)
   assert.equal(updates[4].draftAcceptance, undefined)
   poller.stop()
 })
@@ -826,7 +888,7 @@ vllm:num_requests_running{engine="0"} 1
   assert.equal(await poller.poll(), true)
   assert.equal(await poller.poll(), true)
   assert.equal(updates[1].rate, 0)
-  assert.equal(updates[1].prefillTokens, 0)
+  assert.equal(updates[1].prefillRate, 0)
   assert.equal(formatMeter(updates[1]).state, "WORK")
   poller.stop()
 })

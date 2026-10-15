@@ -3,11 +3,12 @@
 **Beast Engine Telemetry Meter** · version 0.5.0
 
 `opencode-ds4-speed-meter` is a compact, multi-host vLLM engine-telemetry
-meter for OpenCode, Pi, and the modern Hermes 0.20 TUI. The repository name and
-its OpenCode/DS4 dynamic-limit compatibility are retained: on OpenCode, the
-server entrypoint reads `/v1/models` at startup and applies the context and
-completion limits reported by DS4. Configured limits remain the fallback while
-DS4 is unavailable.
+meter for OpenCode, Pi, and the modern Hermes 0.20 TUI. The repository name is
+retained for existing checkouts; the plugin itself is provider-agnostic and
+works with any OpenAI-compatible provider configured through its options. On
+OpenCode 2, the server entrypoint reads `/v1/models` at startup and applies the
+context and completion limits reported by the configured provider. Configured
+limits remain the fallback while the provider is unavailable.
 
 It reports engine throughput and scheduler health, not workstation hardware
 utilization. It does not install a node exporter or daemon, and it is not a
@@ -51,8 +52,9 @@ by itself a telemetry error.
   **6 s** rolling window. `P`, `D`, and `DS` use actual elapsed sample time.
   Counter resets, endpoint changes, offline periods, and idle entry clear the
   prior window.
-- The reader accepts DS4 nested JSON, Entrpi's sectioned text response, and
-  Prometheus/OpenMetrics from vLLM. JSON and Entrpi retain the legacy decode
+- The reader accepts nested JSON (the former DS4 format), Entrpi's sectioned
+  text response, and Prometheus/OpenMetrics from vLLM and TensorFold. JSON and
+  Entrpi retain the legacy decode
   rate and in-flight count; unavailable enriched fields render as `P —`,
   `Req N · KV — · DS —`.
 - In the OpenCode and Pi integrations, resolved telemetry URLs must be HTTP(S)
@@ -65,20 +67,31 @@ by itself a telemetry error.
   last-write-wins: the last event received supplies the meter context.
 
 Counter and request series are summed so tensor-parallel or multi-engine
-exposition becomes one engine view. Only
-`prompt_tokens_by_source_total{source="local_compute"}` feeds `P`.
+exposition becomes one engine view. `P` is the prefill throughput in tokens
+per engine-active second, fed by
+`prompt_tokens_by_source_total{source="local_compute"}` or, for engines that
+expose one aggregate counter without a source label, by
+`prompt_tokens_total` (`vllm:prompt_tokens_total`,
+`tensorfold:prompt_tokens_total`). `D` is the decode throughput over the same
+engine-active time.
 `generation_tokens_total`, a running or waiting request gauge,
 `kv_cache_usage_perc`, and
 `spec_decode_num_{draft,accepted}_tokens_total` provide the enriched metrics.
-Both `vllm:name` and `vllm_name` metric spellings are accepted.
+Both `vllm:name` and `vllm_name` metric spellings are accepted, as are the
+TensorFold names `tensorfold:generation_tokens_total`, `tensorfold:requests_running`,
+`tensorfold:requests_waiting`, `tensorfold:kv_cache_usage_ratio`, and
+`tensorfold:mtp_{drafted,accepted}_total`. TensorFold does not expose a prompt
+breakdown, so its `P` renders as `—`.
 
 ## OpenCode
 
 ### Requirements
 
-- OpenCode 1.18.15 or newer.
-- An OpenAI-compatible provider; the compatibility defaults use ID `ds4`.
-- A DS4 server whose `/v1/models` response reports active model limits.
+- OpenCode 2.0.0 or newer.
+- An OpenAI-compatible provider, selected through the plugin's `providerID`
+  option (any provider ID works; there is no hardcoded default).
+- Optional dynamic limits: a provider whose `/v1/models` response reports
+  active model limits.
 - For the legacy live meter, `GET /v1/stats` exposing
   `server.requests_inflight` and `serving.tokens_decoded`. Entrpi v0.5.6 and
   the equivalent compact nested JSON format are supported.
@@ -94,18 +107,17 @@ opencode debug paths
 The default is `~/.config/opencode`. If the command reports a different config
 directory, substitute that path below.
 
-Clone the plugin inside the config tree and register both package entrypoints:
+Clone the plugin inside the config tree; the server entrypoint is then
+discovered automatically, and the TUI entrypoint is registered in `cli.json`
+as shown in the configuration section below:
 
 ```sh
 mkdir -p ~/.config/opencode/plugins
 git clone https://github.com/jnardiello/opencode-ds4-speed-meter.git \
   ~/.config/opencode/plugins/opencode-ds4-speed-meter
-cd ~/.config/opencode
-opencode plugin ./plugins/opencode-ds4-speed-meter --global --force
 ```
 
-The registration command updates the plugin lists in both
-`opencode.json`/`opencode.jsonc` and `tui.json`. Restart OpenCode afterwards.
+Restart OpenCode afterwards.
 
 ### Provider and TUI configuration
 
@@ -135,12 +147,12 @@ example uses configured limits until the live server reports theirs:
 }
 ```
 
-The TUI entrypoint defaults are:
+The TUI entrypoint has no hardcoded provider defaults: `providerID` selects the
+metered provider and `label` defaults to the uppercased `providerID` (or
+`METER` when `providerID` is omitted). Timing defaults:
 
 ```json
 {
-  "providerID": "ds4",
-  "label": "DS4",
   "statsPaths": ["stats", "../metrics"],
   "intervalMs": 2000,
   "requestTimeoutMs": 1500,
@@ -156,14 +168,16 @@ and takes precedence over all path options. `statsPath` takes precedence over
 `statsPaths`.
 
 For a provider named `beast`, whose OpenAI base URL ends in `/v1` and whose
-Prometheus telemetry is at origin-root `/metrics`, add this entry to `tui.json`:
+Prometheus telemetry is at origin-root `/metrics`, add this entry to
+`cli.json` (OpenCode 2 terminal settings):
 
 ```json
 {
-  "plugin": [
-    [
-      "./plugins/opencode-ds4-speed-meter",
-      {
+  "$schema": "https://opencode.ai/v2/cli.json",
+  "plugins": [
+    {
+      "package": "./plugins/opencode-ds4-speed-meter",
+      "options": {
         "providerID": "beast",
         "label": "Beast",
         "statsPaths": ["stats", "../metrics"],
@@ -171,7 +185,7 @@ Prometheus telemetry is at origin-root `/metrics`, add this entry to `tui.json`:
         "requestTimeoutMs": 1500,
         "windowMs": 6000
       }
-    ]
+    }
   ]
 }
 ```
@@ -179,8 +193,9 @@ Prometheus telemetry is at origin-root `/metrics`, add this entry to `tui.json`:
 The explicit paths simply show the default probing order. To avoid the initial
 `/v1/stats` probe, set `"statsPath": "../metrics"`; use `statsURL` only for an
 explicit same-origin absolute URL. `timeoutMs` independently controls the
-server entrypoint's `/v1/models` startup request, which still defaults to the
-`ds4` provider.
+server entrypoint's `/v1/models` startup request; the server entrypoint is
+enabled by adding the plugin (with `providerID`) to `plugins` in
+`opencode.json(c)` and stays dormant when no `providerID` is configured.
 
 On a narrow terminal, open the normal OpenCode sidebar to see the metric.
 

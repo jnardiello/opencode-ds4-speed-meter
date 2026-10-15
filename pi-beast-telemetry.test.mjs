@@ -214,7 +214,7 @@ test("maps Pi model auth to same-origin core stats targets", () => {
 
 test("renders the Pi widget as the core meter's two aligned lines", () => {
   assert.deepEqual(widgetLines("Beast", { status: "loading" }), [
-    "Beast  LOADING · P — · D — tok/s",
+    "Beast  LOADING · P — tok/s · D — tok/s",
     "       Req — · KV — · DS —",
   ])
 })
@@ -244,13 +244,13 @@ test("starts a TUI-only poller, updates the widget, and cleans up idempotently",
   assert.equal(pollers.instances[0].options.windowMs, 6_000)
   assert.deepEqual(host.widgets[0], [
     BEAST_WIDGET_KEY,
-    ["Beast  LOADING · P — · D — tok/s", "       Req — · KV — · DS —"],
+    ["Beast  LOADING · P — tok/s · D — tok/s", "       Req — · KV — · DS —"],
     { placement: "aboveEditor" },
   ])
 
   pollers.instances[0].emit({ status: "offline" })
   assert.deepEqual(host.widgets.at(-1)[1], [
-    "Beast  OFFLINE · P — · D — tok/s",
+    "Beast  OFFLINE · P — tok/s · D — tok/s",
     "       Req — · KV — · DS —",
   ])
 
@@ -310,7 +310,7 @@ test("model selection stops the old poller immediately and ignores stale async c
 
   firstPoller.emit({ status: "offline" })
   assert.notDeepEqual(host.widgets.at(-1)[1], [
-    "Beast  OFFLINE · P — · D — tok/s",
+    "Beast  OFFLINE · P — tok/s · D — tok/s",
     "       Req — · KV — · DS —",
   ])
 })
